@@ -2,27 +2,44 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
-import tempfile
-import os
+import io
 
-# --- 1. SABİTLER VE YARDIMCI FONKSİYONLAR ---
+# --- CSS İLE GÖRSELDEKİ KIRMIZI BUTON TASARIMI ---
+st.markdown("""
+    <style>
+    div.stButton > button:first-child {
+        background-color: #f05252;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+    }
+    div.stButton > button:first-child:hover {
+        background-color: #d93d3d;
+        color: white;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- ORİJİNAL KODDAN ALINAN DÜZENLİ İFADELER ---[cite: 1]
 SAYI_DESENI = re.compile(
     r'^\(?-?\d{1,3}(\.\d{3})+(,\d+)?\)?%?$'
     r'|^\(?-?\d+,\d+\)?%?$'
     r'|^-$'
 )
-
 DIPNOT_BELIRTEC_DESENI = re.compile(r'^(\(\*+\)|\(\d+\)|\*+)$')
+MADDE_BELIRTEC_DESENI = re.compile(r'^([IVX]+|\d+(\.\d+)*)\.?$')
 
-
+# --- ORİJİNAL KODDAN ALINAN YARDIMCI FONKSİYONLAR ---[cite: 1]
 def kelime_tipi(text):
+    """Kelimenin sayı mı yoksa düz metin mi olduğunu belirler"""
     if SAYI_DESENI.match(text):
         return "SAYI"
     return "METIN"
 
-
 def sayisal_sutun_sinirlarini_bul(gecerli_kelimeler, sayfa_bbox, bosluk_esigi=3):
     sayisal_kelimeler = [k for k in gecerli_kelimeler if kelime_tipi(k['text']) == 'SAYI']
+
     if not sayisal_kelimeler:
         return None
 
@@ -47,52 +64,26 @@ def sayisal_sutun_sinirlarini_bul(gecerli_kelimeler, sayfa_bbox, bosluk_esigi=3)
 
     son_kume_max_x1 = max(k['x1'] for k in kumeler[-1])
     sinirlar.append(son_kume_max_x1 + 5)
+
     return sinirlar
 
-
-def sayfalari_ayikla(girdi_metni):
-    sayfalar = set()
-    parcalar = girdi_metni.split(',')
-
-    for parca in parcalar:
-        parca = parca.strip()
-        if not parca:
-            continue
-
-        if '-' in parca:
-            try:
-                baslangic, bitis = map(int, parca.split('-'))
-                sayfalar.update(range(min(baslangic, bitis), max(baslangic, bitis) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                sayfalar.add(int(parca))
-            except ValueError:
-                pass
-
-    return sorted(list(sayfalar))
-
-
-# --- 2. ANA ÇIKARTMA FONKSİYONU ---
-def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
-    basarili_sayfa_sayisi = 0
-
-    with pd.ExcelWriter(excel_yolu, engine='openpyxl') as writer:
-        with pdfplumber.open(pdf_yolu) as pdf:
+# --- WEB İÇİN UYARLANMIŞ ANA FONKSİYON ---
+# pdf_yolu ve excel_yolu yerine bellek objeleri (file-like objects) kullanılmıştır[cite: 1]
+def extract_pdf_tables(pdf_file, excel_buffer, cekilecek_sayfalar):
+    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+        with pdfplumber.open(pdf_file) as pdf:
             for sayfa_no in cekilecek_sayfalar:
-                st.info(f"⏳ [{sayfa_no}. Sayfa] İşleniyor...")
-
                 try:
                     sayfa = pdf.pages[sayfa_no - 1]
                 except IndexError:
-                    st.error(f"❌ Hata: Belgede {sayfa_no}. sayfa bulunmuyor.")
+                    st.warning(f"Belgede {sayfa_no}. sayfa bulunmuyor.")
                     continue
 
                 tum_kelimeler = sayfa.extract_words(keep_blank_chars=False, extra_attrs=['fontname', 'size'])
                 if not tum_kelimeler:
                     continue
 
+                # 1. ADIM: KELİMELERİ Y EKSENİNDE SATIRLARA AYIR
                 tum_kelimeler.sort(key=lambda w: w['top'])
                 satirlar = []
                 mevcut_satir = [tum_kelimeler[0]]
@@ -107,6 +98,7 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                         mevcut_satir.append(w)
                 satirlar.append(mevcut_satir)
 
+                # 2. ADIM: SATIRLARI TİPE DUYARLI BLOKLARA AYIR
                 satir_bloklari = []
                 for satir in satirlar:
                     satir.sort(key=lambda w: w['x0'])
@@ -118,8 +110,10 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                     for w in satir[1:]:
                         suanki_tip = kelime_tipi(w['text'])
                         bosluk = w['x0'] - mevcut_blok['x1']
+                        madde_belirteci_mi = bool(MADDE_BELIRTEC_DESENI.match(mevcut_blok['text'].strip()))
 
-                        if bosluk > 15 or suanki_tip != mevcut_blok['tip']:
+                        if suanki_tip != mevcut_blok['tip'] or (
+                                bosluk > 15 and not (madde_belirteci_mi and suanki_tip == 'METIN')):
                             bloklar.append(mevcut_blok)
                             mevcut_blok = {'x0': w['x0'], 'x1': w['x1'], 'tip': suanki_tip, 'text': w['text']}
                         else:
@@ -129,6 +123,7 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                     bloklar.append(mevcut_blok)
                     satir_bloklari.append({'satir': satir, 'bloklar': bloklar})
 
+                # 3. ADIM: GÖRÜNMEZ DUVARI DİNAMİK OLARAK TESPİT ET
                 sayfa_genisligi = sayfa.width
                 max_izin_verilen_duvar = sayfa_genisligi * 0.75
                 aciklama_x1_listesi = []
@@ -145,6 +140,7 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                 else:
                     gorunmez_duvar = max_izin_verilen_duvar
 
+                # 4. ADIM: ÇOK KATMANLI FİLTRELEME
                 gecerli_satirlar = []
                 gecerli_kelimeler = []
                 onceki_satir_ihlal_mi = False
@@ -167,13 +163,11 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                             kalkan_aktif = False
                             if len(sb['bloklar']) > 1:
                                 kalkan_aktif = True
-
                             if not kalkan_aktif and onceki_satir_son_kelime and sb['satir']:
                                 suanki_font = sb['satir'][0].get('fontname', '')
                                 suanki_size = round(sb['satir'][0].get('size', 0), 1)
                                 onceki_font = onceki_satir_son_kelime.get('fontname', '')
                                 onceki_size = round(onceki_satir_son_kelime.get('size', 0), 1)
-
                                 if suanki_font != onceki_font or abs(suanki_size - onceki_size) >= 0.5:
                                     kalkan_aktif = True
 
@@ -198,16 +192,15 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                         gecerli_satirlar.append(sb['satir'])
                         gecerli_kelimeler.extend(sb['satir'])
 
+                # 5. ADIM: SÜTUNLARI BUL VE HÜCRELERE YERLEŞTİR
                 dikey_sinirlar = sayisal_sutun_sinirlarini_bul(gecerli_kelimeler, sayfa.bbox, bosluk_esigi=3)
 
                 if dikey_sinirlar is None:
-                    st.warning(f"⚠️ Uyarı: {sayfa_no}. sayfada sayısal veri bulunamadı, extract_table ile deneniyor.")
                     tablo_verisi = sayfa.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
                 else:
                     tablo_verisi = []
                     for satir_kelimeleri in gecerli_satirlar:
                         satir_hucreleri = [""] * (len(dikey_sinirlar) - 1)
-
                         for w in satir_kelimeleri:
                             orta_nokta = (w['x0'] + w['x1']) / 2
                             for i in range(len(dikey_sinirlar) - 1):
@@ -217,81 +210,75 @@ def extract_pdf_tables(pdf_yolu, excel_yolu, cekilecek_sayfalar):
                                     else:
                                         satir_hucreleri[i] = w['text']
                                     break
-
                         if any(hucre.strip() for hucre in satir_hucreleri):
                             tablo_verisi.append(satir_hucreleri)
 
                 if tablo_verisi and len(tablo_verisi) > 1:
                     df = pd.DataFrame(tablo_verisi[1:], columns=tablo_verisi[0])
                     df = df.replace('\n', ' ', regex=True)
-
                     sekme_adi = f"Sayfa_{sayfa_no}"
                     df.to_excel(writer, sheet_name=sekme_adi, index=False)
-                    st.success(f"✅ Başarılı! '{sekme_adi}' sekmesi dosyaya eklendi.")
-                    basarili_sayfa_sayisi += 1
-                else:
-                    st.warning(f"⚠️ Uyarı: {sayfa_no}. sayfada işlenecek tablo bulunamadı.")
 
-    return basarili_sayfa_sayisi
+# --- SAYFA NUMARASI AYIRICI (Örn: 16,17, 22-24) ---
+def parse_page_numbers(page_str):
+    pages = set()
+    for part in page_str.split(','):
+        part = part.strip()
+        if not part: continue
+        if '-' in part:
+            try:
+                start, end = map(int, part.split('-'))
+                pages.update(range(start, end + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                pages.add(int(part))
+            except ValueError:
+                pass
+    return sorted(list(pages))
 
 
-# --- 3. STREAMLIT WEB ARAYÜZÜ ---
-st.set_page_config(page_title="PDF Tablo Çıkarıcı", page_icon="📊", layout="centered")
+# --- STREAMLIT ARAYÜZÜ ---
+st.set_page_config(page_title="PDF'den Excel'e Tablo Çıkarıcı", page_icon="📊")
 
-st.title("📊 PDF'den Excel'e Tablo Çıkarıcı")
-st.markdown("Bir PDF dosyası yükleyin ve içindeki tabloları çekmek istediğiniz sayfaları belirtin. Sayısal veriler içeren bilanço raporlarına yönelik hazırlanmıştır, onun haricindeki tablolar düzgün işlenemeyebilir")
+# Başlık ve Açıklama (Görseldeki ile aynı)
+st.markdown("<h1 style='text-align: center;'>📊 PDF'den Excel'e Tablo Çıkarıcı</h1>", unsafe_allow_html=True)
+st.write("Bir PDF dosyası yükleyin ve içindeki tabloları çekmek istediğiniz sayfaları belirtin. Sayısal veriler içeren bilanço raporlarına yönelik hazırlanmıştır, onun haricindeki tablolar düzgün işlenemeyebilir")
 
-yuklenen_pdf = st.file_uploader("PDF Dosyasını Seçin", type=["pdf"])
+st.write("---")
 
-sayfa_girdisi = st.text_input(
-    "Çekilecek Sayfalar",
-    placeholder="Örn: 16, 22, 60-63, 69",
-    help="Tek sayfa için virgül, aralık belirtmek için tire kullanabilirsiniz."
-)
+# Dosya Yükleyici
+uploaded_file = st.file_uploader("PDF Dosyasını Seçin", type=["pdf"])
 
-if st.button("Tabloları Çıkart 🚀", type="primary"):
+# Sayfa Numarası Girişi
+page_input = st.text_input("Çekilecek Sayfalar", placeholder="Örn: 16,17, 22-24", help="Sayfa numaralarını virgülle ayırarak veya aralık belirterek yazın (Örn: 1, 3, 5-10)")
 
-    cekilecek_sayfalar = sayfalari_ayikla(sayfa_girdisi)
-
-    if yuklenen_pdf is None:
-        st.error("Lütfen bir PDF dosyası yükleyin!")
-    elif not cekilecek_sayfalar:
-        st.error("Lütfen geçerli sayfa numaraları girin!")
+# İşlem Butonu
+if st.button("Tabloları Çıkart 🚀"):
+    if uploaded_file is None:
+        st.error("Lütfen önce bir PDF dosyası yükleyin!")
+    elif not page_input:
+        st.error("Lütfen çekilecek sayfaları belirtin!")
     else:
-        st.info(f"İşleme alınan sayfalar: {', '.join(map(str, cekilecek_sayfalar))}")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-            tmp_pdf.write(yuklenen_pdf.read())
-            pdf_gecici_yol = tmp_pdf.name
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_excel:
-            excel_gecici_yol = tmp_excel.name
-
-        try:
-            with st.spinner("Tablolar PDF'den ayrıştırılıyor, lütfen bekleyin..."):
-                basarili_sayi = extract_pdf_tables(pdf_gecici_yol, excel_gecici_yol, cekilecek_sayfalar)
-
-            if basarili_sayi > 0:
-                st.balloons()
-                st.success("🎉 İşlem tamam! Tüm tablolar Excel dosyasına kaydedildi.")
-
-                with open(excel_gecici_yol, "rb") as f:
-                    excel_verisi = f.read()
-
+        pages_to_extract = parse_page_numbers(page_input)
+        
+        if not pages_to_extract:
+            st.error("Lütfen geçerli sayfa numaraları girin!")
+        else:
+            try:
+                excel_buffer = io.BytesIO()
+                
+                with st.spinner("Tablolar çıkarılıyor, lütfen bekleyin..."):
+                    extract_pdf_tables(uploaded_file, excel_buffer, pages_to_extract)
+                
+                st.success("🎉 İşlem tamam! Tablolar Excel dosyasına aktarıldı.")
+                
                 st.download_button(
-                    label="📥 Çıkarılan Tabloları İndir (Excel)",
-                    data=excel_verisi,
-                    file_name="Cikarilan_Tablolar.xlsx",
+                    label="Excel Dosyasını İndir 📥",
+                    data=excel_buffer.getvalue(),
+                    file_name=f"{uploaded_file.name.replace('.pdf', '')}_Tablolar.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-            else:
-                st.error("Girdiğiniz sayfalarda çıkartılabilecek hiçbir tablo bulunamadı.")
-
-        except Exception as e:
-            st.error(f"Beklenmeyen bir hata oluştu: {str(e)}")
-
-        finally:
-            if os.path.exists(pdf_gecici_yol):
-                os.remove(pdf_gecici_yol)
-            if os.path.exists(excel_gecici_yol):
-                os.remove(excel_gecici_yol)
+            except Exception as e:
+                st.error(f"Bir hata oluştu: {str(e)}")
