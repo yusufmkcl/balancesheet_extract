@@ -243,7 +243,7 @@ def parse_page_numbers(page_str):
 st.set_page_config(page_title="PDF'den Excel'e Tablo Çıkarıcı", page_icon="📊")
 
 # Başlık ve Açıklama (Görseldeki ile aynı)
-st.markdown("<h1 style='text-align: center;'>PDF'den Excel'e Tablo Çıkarıcı</h1>", unsafe_allow_html=True)
+st.title("PDF'den Excel'e Tablo Çıkarıcı")
 st.write("Bir PDF dosyası yükleyin ve içindeki tabloları çekmek istediğiniz sayfaları belirtin. Sayısal veriler içeren bilanço raporlarına yönelik hazırlanmıştır, onun haricindeki tablolar düzgün işlenemeyebilir")
 
 st.write("---")
